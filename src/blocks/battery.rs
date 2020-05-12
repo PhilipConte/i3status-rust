@@ -395,13 +395,15 @@ pub struct Battery {
     output: TextWidget,
     id: String,
     update_interval: Duration,
-    device: Box<dyn BatteryDevice>,
+    device: Result<Box<dyn BatteryDevice>>,
     format: FormatTemplate,
     driver: BatteryDriver,
     good: u64,
     info: u64,
     warning: u64,
     critical: u64,
+    allow_unavailable_battery: bool,
+    stopped: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -464,6 +466,10 @@ pub struct BatteryConfig {
     /// The threshold below which the remaining capacity is shown as critical
     #[serde(default = "BatteryConfig::default_critical")]
     pub critical: u64,
+
+    /// If the battery device cannot be found, do not fail and show the block anyway (sysfs only).
+    #[serde(default = "BatteryConfig::default_allow_unavailable_battery")]
+    pub allow_unavailable_battery: bool,
 }
 
 impl BatteryConfig {
@@ -480,6 +486,10 @@ impl BatteryConfig {
     }
 
     fn default_upower() -> bool {
+        false
+    }
+
+    fn default_allow_unavailable_battery() -> bool {
         false
     }
 
@@ -529,13 +539,22 @@ impl ConfigBlock for Battery {
         };
 
         let id = Uuid::new_v4().to_simple().to_string();
-        let device: Box<dyn BatteryDevice> = match driver {
+        let device: Result<Box<dyn BatteryDevice>> = match driver {
             BatteryDriver::Upower => {
-                let out = UpowerDevice::from_device(&block_config.device)?;
-                out.monitor(id.clone(), update_request);
-                Box::new(out)
+                match UpowerDevice::from_device(&block_config.device) {
+                    Ok(out) => {
+                        out.monitor(id.clone(), update_request);
+                        Ok(Box::new(out))
+                    }
+                    Err(e) => Err(e)
+                }
             }
-            BatteryDriver::Sysfs => Box::new(PowerSupplyDevice::from_device(&block_config.device)?),
+            BatteryDriver::Sysfs => {
+                match PowerSupplyDevice::from_device(&block_config.device) {
+                    Ok(out) => Ok(Box::new(out)),
+                    Err(e) => Err(e)
+                }
+            }
         };
 
         Ok(Battery {
@@ -549,31 +568,39 @@ impl ConfigBlock for Battery {
             info: block_config.info,
             warning: block_config.warning,
             critical: block_config.critical,
+            allow_unavailable_battery: block_config.allow_unavailable_battery,
+            stopped: false,
         })
     }
 }
 
-impl Block for Battery {
-    fn update(&mut self) -> Result<Option<Duration>> {
+impl Battery {
+    fn fallible_update(&mut self, device: Box<dyn BatteryDevice>) -> Result<Option<Duration>> {
         // TODO: Maybe use dbus to immediately signal when the battery state changes.
 
-        let status = self.device.status()?;
+        let status = device.status()?;
 
         if status == "Full" || status == "Not charging" {
             self.output.set_icon("bat_full");
             self.output.set_text("".to_string());
             self.output.set_state(State::Good);
         } else {
-            let capacity = self.device.capacity();
+            let capacity = device.capacity();
             let percentage = match capacity {
-                Ok(capacity) => format!("{}", capacity),
+                Ok(capacity) => {
+                    if self.allow_unavailable_battery && capacity == 0 {
+                        // When Upower DisplayDevice is used, computers without any battery will show up as 0
+                        return Err("".into())
+                    }
+                    format!("{}", capacity)
+                }
                 Err(_) => "×".into(),
             };
             let bar = match capacity {
                 Ok(capacity) => format_percent_bar(capacity as f32),
                 Err(_) => "×".into(),
             };
-            let time = match self.device.time_remaining() {
+            let time = match device.time_remaining() {
                 Ok(time) => match time {
                     0 => "".into(),
                     _ => format!("{}:{:02}", time / 60, time % 60),
@@ -581,7 +608,7 @@ impl Block for Battery {
                 Err(_) => "×".into(),
             };
             // convert µW to W for display
-            let power = match self.device.power_consumption() {
+            let power = match device.power_consumption() {
                 Ok(power) => format!("{:.2}", power as f64 / 1000.0 / 1000.0),
                 Err(_) => "×".into(),
             };
@@ -630,9 +657,41 @@ impl Block for Battery {
             BatteryDriver::Upower => Ok(None),
         }
     }
+}
+
+impl Block for Battery {
+    fn update(&mut self) -> Result<Option<Duration>> {
+        match self.device {
+            Ok(device) => {
+                match self.fallible_update(device) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        if self.allow_unavailable_battery {
+                            self.stopped = true;
+                            Ok(None)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if self.allow_unavailable_battery {
+                    self.stopped = true;
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {
-        vec![&self.output]
+        if !self.stopped {
+            vec![&self.output]
+        } else {
+            vec![]
+        }
     }
 
     fn id(&self) -> &str {
